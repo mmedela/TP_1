@@ -1,0 +1,1 @@
+Finished first naive implementation. Time elapsed 410s on 500.000.000 lines

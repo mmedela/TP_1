@@ -1,3 +1,6 @@
 /target/
 
 /Cargo.lock
+
+/measurements.txt
+/measurements2.txt
