@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap, 
     fs::File, io::{BufReader, Read}, 
-    sync::mpsc::{self, Receiver, Sender}, 
+    sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex}, 
     thread::{self, JoinHandle}, 
-    time::Instant
+    time::Instant, u8
 };
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const NUM_WORKERS: usize = 4;
+const LINE_JUMP_AS_BYTES: u8 = 10;
 
 fn add_entry_to_hash(line: &str, stats: &mut HashMap<String, (f64, f64, f64, usize)>){
     if let Some((city, temp_str)) = line.split_once(';') {
@@ -24,32 +25,32 @@ fn add_entry_to_hash(line: &str, stats: &mut HashMap<String, (f64, f64, f64, usi
     }
 }
 
-fn process_file(file: File)->JoinHandle<HashMap<String, (f64, f64, f64, usize)>>{
-
-    let producer_handle: JoinHandle<HashMap<String, (f64, f64, f64, usize)>> = thread::spawn(move || {
-        let mut reader = BufReader::new(file);
-        let mut stats: HashMap<String, (f64, f64, f64, usize)> = HashMap::new();
+fn process_file(file: File, tx: Sender<Vec<u8>>)->JoinHandle<()>{
+  
+    let producer_handle: JoinHandle<()> = thread::spawn(move || {
+        let mut reader: BufReader<File> = BufReader::new(file);
         
-        let mut buffer = [0u8; CHUNK_SIZE];
+        let mut buffer: Vec<u8> = vec![0; CHUNK_SIZE];
+        let mut incomplete_line:Vec<u8> = Vec::new();
 
-        let mut chunk: &str;
-        let mut line: &str;
         loop{
             let n = reader.read(&mut buffer).unwrap();
             if n == 0{
                 break;
             }
-            let string = String::from_utf8_lossy(&mut buffer);
-            chunk = &string;
-
-            while let Some(pos) = chunk.find('\n') && pos != 0 {
-                line = &chunk[..((pos - 1).max(0))];
-                chunk = &chunk[pos + 1..];
-
-                add_entry_to_hash(line, &mut stats);
+            for i in (0..n).rev() {
+                if buffer[i] != LINE_JUMP_AS_BYTES {
+                    continue;
+                }
+                tx.send([&incomplete_line[..], &buffer[..i]].concat()).expect("Failed to send chunk");
+                incomplete_line.clear();
+                incomplete_line.extend_from_slice(&buffer[i..n]);
+                break;
             }
         }
-        return stats
+        if !buffer.is_empty() {
+            tx.send(buffer).expect("Failed to send final chunk");
+        }
     });
 
     return producer_handle;
@@ -58,17 +59,39 @@ fn process_file(file: File)->JoinHandle<HashMap<String, (f64, f64, f64, usize)>>
 fn main() -> std::io::Result<()>{
     let start = Instant::now();
     let file = File::open("measurements.txt")?;
+    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
 
-    let (tx, rx): (Sender<Vec<String>>, Receiver<Vec<String>>) = mpsc::channel();
+    let producer_handle: JoinHandle<()> = process_file(file, tx);
 
-    let producer_handle = process_file(file);
-    let stats = producer_handle.join().unwrap();
-    
-    // let stats: HashMap<String, (f64, f64, f64, usize)> = process_file(file)?;
-    for (city, (min, max, sum, count)) in &stats {
-        let avg = sum / *count as f64;
-        println!("{}: min={:.1}, max={:.1}, avg={:.1}", city, min, max, avg);
+    let mut consumers_handles:Vec<JoinHandle<HashMap<String, (f64, f64, f64, usize)>>> = Vec::new();
+    let rx: Arc<Mutex<Receiver<Vec<u8>>>> = Arc::new(Mutex::new(rx));
+
+    for _ in 0..NUM_WORKERS {
+
+        let reciever = Arc::clone(&rx);
+        let handle: JoinHandle<HashMap<String, (f64, f64, f64, usize)>> = thread::spawn( move || {
+            let mut stats: HashMap<String, (f64, f64, f64, usize)> = HashMap::new();
+            while let Ok(buffer) = reciever.lock().unwrap().recv(){
+                let mut start = 0;
+                for end in 0..buffer.len(){
+                    if buffer[end] == LINE_JUMP_AS_BYTES{
+                        add_entry_to_hash(str::from_utf8(&buffer[start..end]).unwrap(), &mut stats);
+                        start = end;
+                    }
+                }
+                
+            }
+            return stats;
+        });
+        consumers_handles.push(handle);
     }
+
+    producer_handle.join().unwrap();
+
+    for handle in consumers_handles {
+        handle.join().unwrap();
+    }
+    
     let duration = start.elapsed();
     println!("Tiempo de ejecución: {:?}", duration);
     Ok(())
