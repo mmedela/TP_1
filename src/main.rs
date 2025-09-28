@@ -1,97 +1,140 @@
+use rayon::prelude::*;
 use std::{
-    collections::HashMap, 
-    fs::File, io::{BufReader, Read}, 
-    sync::{mpsc::{self, Receiver, Sender}, Arc, Mutex}, 
-    thread::{self, JoinHandle}, 
-    time::Instant, u8
+    collections::HashMap,
+    fs::File,
+    io::{BufReader, Read},
+    str,
+    sync::mpsc,
+    thread,
+    time::Instant,
 };
 
 const CHUNK_SIZE: usize = 1024 * 1024;
-const NUM_WORKERS: usize = 4;
-const LINE_JUMP_AS_BYTES: u8 = 10;
+const LINE_JUMP_AS_BYTES: u8 = b'\n';
 
-fn add_entry_to_hash(line: &str, stats: &mut HashMap<String, (f64, f64, f64, usize)>){
-    if let Some((city, temp_str)) = line.split_once(';') {
-        if let Ok(temp) = temp_str.parse::<f64>() {
-            stats.entry(city.to_string())
+fn add_entry_to_hash(
+    line: &str,
+    stats: &mut HashMap<String, (f32, f32, f32, usize)>,
+) {
+    if let Some((city, temp_str)) = line.split_once(';')
+        && let Ok(temp) = temp_str.parse::<f32>() {
+            stats
+                .entry(city.to_string())
                 .and_modify(|e| {
                     e.0 = e.0.min(temp);
                     e.1 = e.1.max(temp);
-                    e.2 += temp;        
-                    e.3 += 1;           
+                    e.2 += temp;
+                    e.3 += 1;
                 })
                 .or_insert((temp, temp, temp, 1));
         }
+}
+
+fn stream_chunks(file: File, tx: mpsc::Sender<Vec<u8>>) {
+    let mut reader = BufReader::new(file);
+    let mut buffer = vec![0; CHUNK_SIZE];
+    let mut leftover = Vec::new();
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).unwrap();
+        if bytes_read == 0 {
+            break;
+        }
+
+        let data = &buffer[..bytes_read];
+        let mut split_at = None;
+
+        for i in (0..data.len()).rev() {
+            if data[i] == LINE_JUMP_AS_BYTES {
+                split_at = Some(i + 1);
+                break;
+            }
+        }
+
+        match split_at {
+            Some(index) => {
+                let mut chunk = leftover.clone();
+                chunk.extend_from_slice(&data[..index]);
+                tx.send(chunk).unwrap();
+
+                leftover.clear();
+                leftover.extend_from_slice(&data[index..]);
+            }
+            None => {
+                leftover.extend_from_slice(data);
+            }
+        }
+    }
+
+    if !leftover.is_empty() {
+        tx.send(leftover).unwrap();
     }
 }
 
-fn process_file(file: File, tx: Sender<Vec<u8>>)->JoinHandle<()>{
-  
-    let producer_handle: JoinHandle<()> = thread::spawn(move || {
-        let mut reader: BufReader<File> = BufReader::new(file);
-        
-        let mut buffer: Vec<u8> = vec![0; CHUNK_SIZE];
-        let mut incomplete_line:Vec<u8> = Vec::new();
+fn process_chunk(buffer: Vec<u8>) -> HashMap<String, (f32, f32, f32, usize)> {
+    let mut stats = HashMap::new();
+    let mut start = 0;
 
-        loop{
-            let n = reader.read(&mut buffer).unwrap();
-            if n == 0{
-                break;
+    for i in 0..buffer.len() {
+        if buffer[i] == LINE_JUMP_AS_BYTES {
+            if let Ok(line) = str::from_utf8(&buffer[start..i]) {
+                add_entry_to_hash(line, &mut stats);
             }
-            for i in (0..n).rev() {
-                if buffer[i] != LINE_JUMP_AS_BYTES {
-                    continue;
-                }
-                tx.send([&incomplete_line[..], &buffer[..i]].concat()).expect("Failed to send chunk");
-                incomplete_line.clear();
-                incomplete_line.extend_from_slice(&buffer[i..n]);
-                break;
-            }
+            start = i + 1;
         }
-        if !buffer.is_empty() {
-            tx.send(buffer).expect("Failed to send final chunk");
+    }
+
+    if start < buffer.len()
+        && let Ok(line) = str::from_utf8(&buffer[start..]) {
+            add_entry_to_hash(line, &mut stats);
         }
+
+    stats
+}
+
+fn merge_maps(
+    mut a: HashMap<String, (f32, f32, f32, usize)>,
+    b: HashMap<String, (f32, f32, f32, usize)>,
+) -> HashMap<String, (f32, f32, f32, usize)> {
+    for (city, (min, max, sum, count)) in b {
+        a.entry(city)
+            .and_modify(|e| {
+                e.0 = e.0.min(min);
+                e.1 = e.1.max(max);
+                e.2 += sum;
+                e.3 += count;
+            })
+            .or_insert((min, max, sum, count));
+    }
+    a
+}
+
+fn main() -> std::io::Result<()> {
+    let start = Instant::now();
+
+    let file = File::open("measurements.txt")?;
+    let (tx, rx) = mpsc::channel();
+
+    let producer = thread::spawn(move || {
+        stream_chunks(file, tx);
     });
 
-    return producer_handle;
-}
+    let final_stats = rx
+        .into_iter()
+        .par_bridge()
+        .map(process_chunk)
+        .reduce(HashMap::new, merge_maps);
 
-fn main() -> std::io::Result<()>{
-    let start = Instant::now();
-    let file = File::open("measurements.txt")?;
-    let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
+    producer.join().unwrap();
 
-    let producer_handle: JoinHandle<()> = process_file(file, tx);
-
-    let mut consumers_handles:Vec<JoinHandle<HashMap<String, (f64, f64, f64, usize)>>> = Vec::new();
-    let rx: Arc<Mutex<Receiver<Vec<u8>>>> = Arc::new(Mutex::new(rx));
-
-    for _ in 0..NUM_WORKERS {
-
-        let reciever = Arc::clone(&rx);
-        let handle: JoinHandle<HashMap<String, (f64, f64, f64, usize)>> = thread::spawn( move || {
-            let mut stats: HashMap<String, (f64, f64, f64, usize)> = HashMap::new();
-            while let Ok(buffer) = reciever.lock().unwrap().recv(){
-                let mut start = 0;
-                for end in 0..buffer.len(){
-                    if buffer[end] == LINE_JUMP_AS_BYTES{
-                        add_entry_to_hash(str::from_utf8(&buffer[start..end]).unwrap(), &mut stats);
-                        start = end;
-                    }
-                }
-                
-            }
-            return stats;
-        });
-        consumers_handles.push(handle);
+    for (city, (min, max, sum, count)) in &final_stats {
+        let avg = sum / *count as f32;
+        println!(
+            "{} -> min: {:.2}, max: {:.2}, avg: {:.2}",
+            city, min, max, avg
+        );
     }
 
-    producer_handle.join().unwrap();
-
-    for handle in consumers_handles {
-        handle.join().unwrap();
-    }
-    
     let duration = start.elapsed();
     println!("Tiempo de ejecución: {:?}", duration);
     Ok(())
